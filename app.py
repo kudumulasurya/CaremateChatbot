@@ -15,6 +15,8 @@ from tools.vector_store import get_or_create_vectorstore
 
 from sentence_transformers import SentenceTransformer
 import numpy as np
+from tools.specialization_utils import normalize_profile
+from tools.lang_utils import detect_language
 
 # --------------------------------------
 # Load environment variables
@@ -28,8 +30,9 @@ app = Flask(__name__)
 CORS(app, supports_credentials=True)
 
 # Load local embedding model
-print("Loading local embedding model... (this will take a few seconds the first time)")
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+print("Loading multilingual embedding model... (this will take a few seconds the first time)")
+# multilingual model for better cross-lingual matching
+embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 print("Model loaded successfully ✅")
 
 app.secret_key = secrets.token_hex(32)
@@ -66,44 +69,188 @@ def find_related_doctors(user_message, limit=3):
     print(doctors)
     if not doctors:
         return []
-
+    # Get user embedding and ensure it's a numpy array
     user_emb = get_embedding(user_message)
-    similarities = []
+    if not isinstance(user_emb, np.ndarray):
+        user_emb = np.array(user_emb)
 
+    # Preprocess message for simple keyword matching
+    user_text_lc = (user_message or "").lower()
+
+    # Symptom -> specialization keywords mapping (tune as needed)
+    SPECIALIZATION_KEYWORDS = {
+        "cardiologist": ["chest pain", "shortness of breath", "palpitat", "heart attack", "angina", "tachycardia"],
+        "pulmonologist": ["cough", "shortness of breath", "wheeze", "wheezing", "bronchitis", "asthma"],
+        "dermatologist": ["rash", "itch", "itching", "redness", "eczema", "psoriasis", "skin"],
+        "ent": ["ear", "hearing", "hearing loss", "ear pain", "tinnitus", "hoarseness"],
+        "neurology": ["headache", "seizure", "numbness", "weakness", "dizziness", "migraine"],
+        "pediatrician": ["child", "kid", "baby", "fever in child", "pediatric"],
+        "orthopedist": ["joint pain", "back pain", "fracture", "sprain", "arthritis"],
+    }
+
+    # Canonicalization map for specialization names (common typos / variants)
+    CANONICAL_SPECIALIZATIONS = {
+        "pediadrist": "pediatrician",
+        "pediatrist": "pediatrician",
+        "pediatrician": "pediatrician",
+        "cardiologist": "cardiologist",
+        "cardiology": "cardiologist",
+        "ent": "ent",
+        "ear nose throat": "ent",
+        "neurology": "neurology",
+        "neuro": "neurology",
+        "dermatologist": "dermatologist",
+        "derm": "dermatologist",
+        "orthopedist": "orthopedist",
+        "orthopedic": "orthopedist",
+    }
+
+    # Detect which specializations are implied by the user's message
+    implied_specs = set()
+    for spec, keys in SPECIALIZATION_KEYWORDS.items():
+        for k in keys:
+            if k in user_text_lc:
+                # canonicalize implied spec if present
+                implied_specs.add(CANONICAL_SPECIALIZATIONS.get(spec, spec))
+                break
+
+    # First pass: canonicalize specializations and build available spec set
+    available_specs = set()
     for doc in doctors:
         profile = doc.get("doctorProfile", {})
-        print(profile)
+        raw_spec = (profile.get("specialization", "") or "").strip().lower()
+        canon_spec = CANONICAL_SPECIALIZATIONS.get(raw_spec, raw_spec) if raw_spec else ''
+        if canon_spec:
+            available_specs.add(canon_spec)
+        doc['_canonical_specialization'] = canon_spec
+
+    # If implied specialization exists but no doctors of that specialization are available, return empty
+    if implied_specs:
+        for implied in implied_specs:
+            if implied and implied not in available_specs:
+                return []
+
+    # Second pass: compute similarities and scores
+    similarities = []
+    score_map = {}
+    for doc in doctors:
+        profile = doc.get("doctorProfile", {})
         specialization = profile.get("specialization", "")
-        print(specialization)
-        qualifications = ", ".join(profile.get("qualifications", []))
+        qualifications = profile.get("qualifications", [])
         years_exp = profile.get("yearsExperience", "")
-        
-        doc_text = f"{specialization} {qualifications} {years_exp} years experience"
+
+        parts = []
+        if specialization:
+            parts.append(specialization)
+        if qualifications:
+            parts.append(" ".join(qualifications))
+        if years_exp:
+            parts.append(f"{years_exp} years experience")
+        bio = profile.get("bio", "") or doc.get("bio", "")
+        if bio:
+            parts.append(bio)
+        clinic = profile.get("clinic", "")
+        if clinic:
+            parts.append(clinic)
+        languages = profile.get("languages", [])
+        if languages:
+            parts.append(" ".join(languages))
+
+        doc_text = " ".join(parts).strip()
+        if not doc_text:
+            doc_text = f"{doc.get('name','')} {specialization}"
+
         doc_emb = doc.get("embedding")
-
-        # If embedding not present, create and save it
         if not doc_emb:
-            doc_emb = get_embedding(doc_text)
-            db["users"].update_one(
-                {"_id": doc["_id"]},
-                {"$set": {"embedding": doc_emb.tolist()}}
-            )
+            try:
+                # Normalize and persist canonical specialization (if changed)
+                profile = doc.get('doctorProfile', {}) or {}
+                normalized_profile = normalize_profile(profile)
+                if normalized_profile.get('specialization') and normalized_profile.get('specialization') != profile.get('specialization'):
+                    db["users"].update_one({"_id": doc["_id"]}, {"$set": {"doctorProfile.specialization": normalized_profile.get('specialization')}})
+
+                # Rebuild doc_text using normalized profile
+                doc_text = " ".join([p for p in [
+                    normalized_profile.get('specialization',''),
+                    " ".join(normalized_profile.get('qualifications', [])) if normalized_profile.get('qualifications') else '',
+                    f"{normalized_profile.get('yearsExperience','')} years experience" if normalized_profile.get('yearsExperience') else '',
+                    normalized_profile.get('bio','') or doc.get('bio',''),
+                    normalized_profile.get('clinic',''),
+                    " ".join(normalized_profile.get('languages', [])) if normalized_profile.get('languages') else ''
+                ] if p]).strip()
+
+                computed = get_embedding(doc_text)
+                db["users"].update_one({"_id": doc["_id"]}, {"$set": {"embedding": computed.tolist()}})
+                doc_emb = np.array(computed)
+            except Exception as e:
+                print(f"Error computing embedding for doctor {doc.get('name')}: {e}")
+                continue
         else:
-            doc_emb = np.array(doc_emb)
+            doc_emb = np.array(doc_emb, dtype=float)
 
-        similarity = np.dot(user_emb, doc_emb)
-        similarities.append((doc, similarity))
+        # Ensure no-zero norm
+        user_norm = np.linalg.norm(user_emb)
+        doc_norm = np.linalg.norm(doc_emb)
+        if user_norm == 0 or doc_norm == 0:
+            continue
 
+        similarity = float(np.dot(user_emb, doc_emb) / (user_norm * doc_norm))
+
+        # Boosting logic
+        boost = 0.0
+        spec_lc = (doc.get('_canonical_specialization') or specialization or "").lower()
+        for implied in implied_specs:
+            if implied and (implied in spec_lc or spec_lc in implied):
+                boost += 0.35
+        if specialization and specialization.lower() in user_text_lc:
+            boost += 0.12
+        for qual in qualifications:
+            if qual and qual.lower() in user_text_lc:
+                boost += 0.05
+
+        score = similarity + boost
+        similarities.append((doc, score))
+        score_map[doc.get('_id')] = score
+
+    # Return top matches above a reasonable similarity threshold
     similarities.sort(key=lambda x: x[1], reverse=True)
-    top_matches = [d[0] for d in similarities[:limit]]
 
-    return [{
-        "name": d.get("name", ""),
-        "email": d.get("email", ""),
-        "specialization": d.get("doctorProfile", {}).get("specialization", ""),
-        "yearsExperience": d.get("doctorProfile", {}).get("yearsExperience", ""),
-        "qualifications": d.get("doctorProfile", {}).get("qualifications", []),
-    } for d in top_matches]
+    # Filter out low-similarity matches (threshold can be tuned)
+    SIMILARITY_THRESHOLD = 0.15
+    filtered = [d for d in similarities if d[1] >= SIMILARITY_THRESHOLD]
+
+    top_matches = [d[0] for d in filtered[:limit]]
+
+    # If the user's message strongly implies a specialization but no doctors of that
+    # canonical specialization exist, return an empty list (avoid misleading suggestions)
+    if implied_specs:
+        # if any implied spec is not available, and none of top_matches match, return []
+        for implied in implied_specs:
+            if implied and implied not in available_specs:
+                return []
+
+    results = []
+    for d in top_matches:
+        doc_id = d.get('_id')
+        score = score_map.get(doc_id)
+        if score is None:
+            # fallback: search in similarities list
+            score = next((s for (dd, s) in similarities if dd.get('_id') == doc_id), None)
+        try:
+            score = round(float(score), 4) if score is not None else None
+        except Exception:
+            score = None
+
+        results.append({
+            "name": d.get("name", ""),
+            "email": d.get("email", ""),
+            "specialization": d.get("doctorProfile", {}).get("specialization", ""),
+            "yearsExperience": d.get("doctorProfile", {}).get("yearsExperience", ""),
+            "qualifications": d.get("doctorProfile", {}).get("qualifications", []),
+            "score": score
+        })
+
+    return results
 
 
 # --------------------------------------
@@ -220,6 +367,10 @@ def chat():
     # Save user message
     save_message(session_id, 'user', message)
 
+    # Detect user language and store in conversation state so downstream
+    # agents/LLM can respond in the same language.
+    user_lang = detect_language(message)
+
     # Fetch last 5 messages (for context)
     previous_messages = list(messages_collection.find(
         {"session_id": session_id}
@@ -238,6 +389,9 @@ def chat():
 
     conversation_state = conversation_states[session_id]
     conversation_state = reset_query_state(conversation_state)
+
+    # attach detected language
+    conversation_state['language'] = user_lang
 
     # Add both context and question
     conversation_state["context"] = context.strip()
@@ -329,6 +483,90 @@ def new_chat():
 @app.route('/api/health')
 def health():
     return jsonify({'status': 'healthy', 'service': 'MediGenius'})
+
+
+# ----- Admin: create or update doctor (canonicalize before write) -----
+@app.route('/api/admin/doctor', methods=['POST'])
+def upsert_doctor():
+    """Create or update a doctor record. This endpoint will canonicalize
+    the provided `doctorProfile` using `normalize_profile` before persisting.
+
+    Expected JSON body:
+      {
+        "name": "Dr. Alice",
+        "email": "alice@example.com",
+        "doctorProfile": { ... }
+      }
+
+    If a doctor with the same email exists, it will be updated (upsert).
+    For safety this endpoint is intended for admin use only; add auth in
+    front of it for production.
+    """
+    data = request.json or {}
+    email = (data.get('email') or '').strip()
+    name = data.get('name') or data.get('displayName') or ''
+    raw_profile = data.get('doctorProfile') or {}
+
+    if not email:
+        return jsonify({'error': 'email is required', 'success': False}), 400
+
+    # Canonicalize/normalize the profile
+    try:
+        normalized = normalize_profile(raw_profile or {})
+    except Exception as e:
+        return jsonify({'error': f'failed to normalize profile: {e}', 'success': False}), 500
+
+    # Build document to upsert
+    doc = {
+        'name': name,
+        'email': email,
+        'role': 'doctor',
+        'doctorProfile': normalized,
+    }
+
+    # Optional top-level bio field
+    if normalized.get('bio'):
+        doc['bio'] = normalized.get('bio')
+
+    try:
+        result = db['users'].update_one({'email': email}, {'$set': doc}, upsert=True)
+    except Exception as e:
+        return jsonify({'error': f'database upsert failed: {e}', 'success': False}), 500
+
+    # Compute and persist embedding for the doctor text (best-effort)
+    try:
+        # Build text used for embedding (same logic as find_related_doctors)
+        parts = [
+            normalized.get('specialization',''),
+            ' '.join(normalized.get('qualifications', [])) if normalized.get('qualifications') else '',
+            f"{normalized.get('yearsExperience','')} years experience" if normalized.get('yearsExperience') else '',
+            normalized.get('bio',''),
+            normalized.get('clinic',''),
+            ' '.join(normalized.get('languages', [])) if normalized.get('languages') else ''
+        ]
+        doc_text = ' '.join([p for p in parts if p]).strip()
+        if not doc_text:
+            doc_text = name or email
+
+        emb = get_embedding(doc_text)
+        # store as plain list so other scripts can read
+        db['users'].update_one({'email': email}, {'$set': {'embedding': emb.tolist()}})
+    except Exception as e:
+        # Do not fail the whole request because embedding failed; return warning
+        return jsonify({
+            'message': 'doctor upserted, but embedding failed',
+            'email': email,
+            'upserted': bool(result.upserted_id or result.matched_count),
+            'warning': str(e),
+            'success': True
+        }), 200
+
+    return jsonify({
+        'message': 'doctor upserted',
+        'email': email,
+        'upserted': bool(result.upserted_id or result.matched_count),
+        'success': True
+    })
 
 
 # --------------------------------------
