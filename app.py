@@ -27,7 +27,27 @@ load_dotenv()
 # Flask app setup
 # --------------------------------------
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
+
+
+# Allow all origins (development). For production, restrict this to a safe list.
+FRONTEND_URL = "https://sanketyelugotla-caremate.vercel.app"
+
+CORS(
+    app,
+    supports_credentials=True,
+    resources={
+        r"/*": {"origins": [FRONTEND_URL, "http://localhost:3000"]}
+    }
+)
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
+    return response
+# --------------------------------------
 
 # Load local embedding model
 print("Loading multilingual embedding model... (this will take a few seconds the first time)")
@@ -586,4 +606,5 @@ def upsert_doctor():
 # --------------------------------------
 if __name__ == '__main__':
     initialize_system()
-    app.run(debug=True, port=8000)
+    # Bind to all interfaces so remote port-forwarding / tunnels can reach the server.
+    app.run(host='0.0.0.0', debug=True, port=8000)
